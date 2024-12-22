@@ -892,6 +892,11 @@ def main():
 
     # 2) 生存分析（可选）
     df = prepare_basic_survival_data(df)
+
+    # 2.5) ---------------------- 保存 df 到本地 CSV ----------------------
+    df.to_csv("result/master_dataset.csv", index=False, encoding="utf_8_sig")
+    print("DataFrame saved to result/final_dataset.csv (UTF-8 with BOM).")
+
     # df_km = basic_survival_analysis(df)
     # df_lr, stats_by_type = analyze_campaign_types(df)
 
