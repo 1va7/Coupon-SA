@@ -637,6 +637,93 @@ def plot_survival_curves(rsf, y_train, X, filename="result/rsf_survival_curves.p
     plt.close()
 
 
+def plot_partial_dependence_rsf(
+    rsf,
+    X,
+    feature,
+    times=[30],
+    n_points=20,
+    sample_size=None,
+    figure_path="result/pdp_{feature}.png"
+):
+    """
+    绘制对随机生存森林 (RSF) 的部分依赖图 (Partial Dependence Plot),
+    展示当“feature”从低到高变化时, 在给定 times (一组时间点) 下,
+    模型预测的生存概率(平均)如何变化。
+
+    Args:
+        rsf: 训练好的 RandomSurvivalForest 模型
+        X:   特征 DataFrame, 每行对应一个样本
+        feature: 要分析的特征列名 (str)
+        times:   列表, 指定想查看的时间点, 比如 [30, 60, 90]
+        n_points: 对 feature 坐标取多少个网格点
+        sample_size: 若数据量大, 可以先抽样多少行再画, 减少计算量. 为 None 则不抽样
+        figure_path: 图片保存路径, 默认 result/pdp_{feature}.png
+                     其中 {feature} 会被替换为实际特征名
+
+    Note:
+        - 对于连续特征, 我们在 min ~ max 之间均匀取 n_points 个值
+        - 对于离散特征, 也可以取 unique 值.
+        - 这里做的是一条“平均”曲线, 对所有样本, 只修改该 feature, 其它特征保持原样.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # 若需要抽样, 以减少计算量
+    if sample_size is not None and sample_size < len(X):
+        X_sample = X.sample(sample_size, random_state=42).copy()
+    else:
+        X_sample = X.copy()
+
+    # 计算 feature 的取值网格
+    x_min, x_max = X_sample[feature].min(), X_sample[feature].max()
+    grid_values = np.linspace(x_min, x_max, n_points)
+
+    # 对每个 time, 计算 PDP 曲线(网格长度= n_points)
+    pd_curves = {}  # time -> [平均生存概率...]
+    for t in times:
+        pd_curves[t] = []
+
+    # 主循环：在每个 grid_val 上, 替换 X_sample[feature] -> grid_val, 预测生存概率
+    for grid_val in grid_values:
+        X_modified = X_sample.copy()
+        X_modified[feature] = grid_val  # 替换目标特征
+
+        # 调用 RSF 的 predict_survival_function(), 得到每行的生存函数
+        surv_fns = rsf.predict_survival_function(X_modified)
+        # surv_fns 是个 list, 每个元素是个可调用, 你可以 surv_fns[i](time)
+        # scikit-survival 会返回 array-like 的生存函数
+
+        # 对所有样本, 计算在指定时间点 times[i] 下的生存概率, 然后取平均
+        n_sample = len(X_modified)
+        # 循环 times
+        for t in times:
+            # 对每个样本 i, surv_fns[i](t), 最后平均
+            surv_probs = [fn(t) for fn in surv_fns]
+            mean_prob = np.mean(surv_probs)
+            pd_curves[t].append(mean_prob)
+
+    # 绘图
+    plt.figure(figsize=(8, 6))
+    for t in times:
+        plt.plot(
+            grid_values,
+            pd_curves[t],
+            label=f"Time={t} days"
+        )
+
+    plt.title(f"Partial Dependence of '{feature}' on Survival Probability")
+    plt.xlabel(f"{feature} value")
+    plt.ylabel("Average Survival Probability")
+    plt.grid(True)
+    plt.legend()
+    save_path = figure_path.format(feature=feature)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"PDP for '{feature}' saved as {save_path}")
+
+
 def run_rsf_analysis(df):
     X, y, scaler = prepare_rsf_data(df)
 
@@ -689,6 +776,20 @@ def run_rsf_analysis(df):
 
     print("\nFeature Summary Statistics:")
     print(X_no_na.describe())
+
+    # 额外：对前 5 个最重要的特征作 PDP
+    top_features = importance_df['feature'].head(5).tolist()  # 取排名前5
+    for f in top_features:
+        # 在 30, 60, 90 三个时间点画 PDP
+        plot_partial_dependence_rsf(
+            rsf,
+            X_train,
+            feature=f,
+            times=[30, 60, 90],
+            n_points=20,
+            sample_size=200,
+            figure_path="result/pdp_{feature}.png"
+        )
 
     return rsf, importance_df, (X_train, X_test, y_train, y_test)
 
