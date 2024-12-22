@@ -13,6 +13,7 @@ from sklearn.inspection import permutation_importance
 import seaborn as sns
 sns.set_style('whitegrid')
 import warnings
+import reportlab
 warnings.filterwarnings('ignore')
 
 
@@ -132,11 +133,14 @@ def create_complete_dataset():
     # final_df.to_csv('coupon_complete_data.csv', index=False)
 
 
-def prepare_basic_survival_data(df):
+def prepare_basic_survival_data(df, hh_demographic_path='data/hh_demographic.csv'):
     """
-    Prepare the basic survival analysis dataset
+    Prepare the basic survival analysis dataset with demographic features
     """
-    # Calculate duration and event indicator
+    # 读取人口统计数据
+    hh_demo = pd.read_csv(hh_demographic_path)
+
+    # 计算基础的生存时间和事件指示符
     df['duration'] = df.apply(
         lambda x: x['day_redeemed'] - x['day_issued'] if pd.notnull(x['day_redeemed'])
         else x['day_expired'] - x['day_issued'],
@@ -144,8 +148,105 @@ def prepare_basic_survival_data(df):
     )
     df['event'] = df['day_redeemed'].notna().astype(int)
 
+    # 合并人口统计数据
+    df = df.merge(
+        hh_demo,
+        on='household_key',
+        how='left'
+    )
+
     return df
 
+
+def prepare_cox_data(df):
+    """
+    Prepare data for Cox proportional hazards model with demographic features
+    """
+    # Campaign type indicator
+    typeC_campaigns = [3, 6, 14, 15, 20, 27]
+    df['is_typeC'] = df['CAMPAIGN'].isin(typeC_campaigns).astype(int)
+
+    # Calculate validity period
+    df['validity_period'] = df['day_expired'] - df['day_issued']
+
+    # 对连续变量进行标准化
+    df['day_issued_std'] = (df['day_issued'] - df['day_issued'].mean()) / df['day_issued'].std()
+    df['validity_period_std'] = (df['validity_period'] - df['validity_period'].mean()) / df['validity_period'].std()
+
+    # 处理分类变量
+    categorical_columns = {
+        'classification_1': 'class1',
+        'classification_2': 'class2',
+        'classification_3': 'class3',
+        'HOMEOWNER_DESC': 'homeowner',
+        'classification_4': 'class4',
+        'classification_5': 'class5',
+        'KID_CATEGORY_DESC': 'kids'
+    }
+
+    # 为每个分类变量创建虚拟变量
+    dummy_dfs = []
+    for col, prefix in categorical_columns.items():
+        if col in df.columns:
+            dummy_df = pd.get_dummies(df[col], prefix=prefix, drop_first=True)
+            dummy_dfs.append(dummy_df)
+
+    # 准备最终的数据集
+    cox_data = pd.concat(
+        [df[['duration', 'event', 'is_typeC', 'day_issued_std', 'validity_period_std']]] + dummy_dfs,
+        axis=1
+    )
+
+    return cox_data
+
+
+def prepare_rsf_data(df):
+    """
+    Prepare data for Random Survival Forest analysis with demographic features
+    """
+    # Create campaign type indicator
+    typeC_campaigns = [3, 6, 14, 15, 20, 27]
+    df['is_typeC'] = df['CAMPAIGN'].isin(typeC_campaigns).astype(int)
+
+    # Calculate validity period
+    df['validity_period'] = df['day_expired'] - df['day_issued']
+
+    # Standardize continuous variables
+    scaler = StandardScaler()
+    features_to_scale = ['day_issued', 'validity_period']
+    df_scaled = df.copy()
+    df_scaled[features_to_scale] = scaler.fit_transform(df[features_to_scale])
+
+    # 处理分类变量
+    categorical_columns = {
+        'classification_1': 'class1',
+        'classification_2': 'class2',
+        'classification_3': 'class3',
+        'HOMEOWNER_DESC': 'homeowner',
+        'classification_4': 'class4',
+        'classification_5': 'class5',
+        'KID_CATEGORY_DESC': 'kids'
+    }
+
+    # 为每个分类变量创建虚拟变量
+    dummy_dfs = []
+    for col, prefix in categorical_columns.items():
+        if col in df.columns:
+            dummy_df = pd.get_dummies(df[col], prefix=prefix, drop_first=True)
+            dummy_dfs.append(dummy_df)
+
+    # Prepare feature matrix
+    X = pd.concat(
+        [df_scaled[['is_typeC', 'day_issued', 'validity_period']]] + dummy_dfs,
+        axis=1
+    )
+
+    # Prepare survival data structure
+    y = np.zeros(len(df), dtype=[('event', bool), ('time', float)])
+    y['event'] = df['event'].astype(bool)
+    y['time'] = df['duration']
+
+    return X, y, scaler
 
 def plot_km_curve(df, group_col=None):
     """
@@ -321,69 +422,71 @@ def analyze_campaign_types(df):
     return results, stats_by_type
 
 
-def prepare_cox_data(df):
+def plot_hazard_ratios(cph, filename="hazard_ratios.png", title="Significant Hazard Ratios from Cox Model"):
     """
-    Prepare data for Cox proportional hazards model
+    Plot hazard ratios with confidence intervals for all variables
     """
-    # Create campaign type indicator (0 for TypeB, 1 for TypeC)
-    typeC_campaigns = [3, 6, 14, 15, 20, 27]
-    df['is_typeC'] = df['CAMPAIGN'].isin(typeC_campaigns).astype(int)
-
-    # Calculate validity period
-    df['validity_period'] = df['day_expired'] - df['day_issued']
-
-    # Standardize continuous variables
-    df['day_issued_std'] = (df['day_issued'] - df['day_issued'].mean()) / df['day_issued'].std()
-    df['validity_period_std'] = (df['validity_period'] - df['validity_period'].mean()) / df['validity_period'].std()
-
-    # Prepare final dataset for Cox model
-    cox_data = df[[
-        'duration',
-        'event',
-        'is_typeC',
-        'day_issued_std',
-        'validity_period_std'
-    ]].copy()
-
-    return cox_data
-
-
-def plot_hazard_ratios(cph):
-    """
-    Plot hazard ratios with confidence intervals
-    """
-    # Extract hazard ratios and confidence intervals
+    # Extract hazard ratios and confidence intervals for all variables
     hazard_ratios = pd.DataFrame({
         'HR': np.exp(cph.params_),
         'lower': np.exp(cph.confidence_intervals_.iloc[:, 0]),
-        'upper': np.exp(cph.confidence_intervals_.iloc[:, 1]),
-        'variable': ['Campaign Type', 'Issue Day', 'Validity Period']
+        'upper': np.exp(cph.confidence_intervals_.iloc[:, 1])
     })
 
+    # Add variable names as index
+    hazard_ratios.index = cph.params_.index
+
+    # Only plot significant variables (p < 0.05) or main effects
+    main_effects = ['is_typeC', 'day_issued_std', 'validity_period_std']
+    significant_vars = cph.summary.index[cph.summary['p'] < 0.05].tolist()
+    vars_to_plot = list(set(main_effects + significant_vars))
+
+    hazard_ratios_filtered = hazard_ratios.loc[vars_to_plot]
+
     # Create figure
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, len(vars_to_plot) * 0.5))
+    plt.clf()
 
     # Plot points and lines
-    for i, row in hazard_ratios.iterrows():
-        plt.plot([row['lower'], row['upper']], [i, i], 'b-', linewidth=2)
-        plt.plot(row['HR'], i, 'bo', markersize=8)
+    y_positions = range(len(vars_to_plot))
 
-        # Add text
+    # Plot confidence intervals
+    plt.errorbar(
+        x=hazard_ratios_filtered['HR'],
+        y=y_positions,
+        xerr=[
+            hazard_ratios_filtered['HR'] - hazard_ratios_filtered['lower'],
+            hazard_ratios_filtered['upper'] - hazard_ratios_filtered['HR']
+        ],
+        fmt='o',
+        capsize=5,
+        color='blue',
+        markersize=8
+    )
+
+    # Add reference line at HR=1
+    plt.axvline(x=1, color='k', linestyle='--', alpha=0.5)
+
+    # Customize plot
+    plt.yticks(y_positions, vars_to_plot)
+    plt.xlabel('Hazard Ratio (95% CI)')
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+
+    # Add HR values as text
+    for i, (var, row) in enumerate(hazard_ratios_filtered.iterrows()):
         plt.text(
             row['upper'] + 0.01,
             i,
-            f"HR={row['HR']:.2f} ({row['lower']:.2f}-{row['upper']:.2f})",
+            f"HR={row['HR']:.2f}\n({row['lower']:.2f}-{row['upper']:.2f})",
             verticalalignment='center'
         )
 
-    # Customize plot
-    plt.axvline(x=1, color='k', linestyle='--', alpha=0.5)
-    plt.yticks(range(len(hazard_ratios)), hazard_ratios['variable'])
-    plt.xlabel('Hazard Ratio (95% CI)')
-    plt.title('Hazard Ratios from Cox Model')
-    plt.grid(True, alpha=0.3)
-
     plt.tight_layout()
+    fig = plt.gcf()
+    # 保存
+    fig.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close(fig)
     return plt.gcf()
 
 
@@ -433,34 +536,6 @@ def run_cox_analysis(df):
     return cph, cox_data
 
 
-def prepare_rsf_data(df):
-    """
-    Prepare data for Random Survival Forest analysis
-    """
-    # Create campaign type indicator
-    typeC_campaigns = [3, 6, 14, 15, 20, 27]
-    df['is_typeC'] = df['CAMPAIGN'].isin(typeC_campaigns).astype(int)
-
-    # Calculate validity period
-    df['validity_period'] = df['day_expired'] - df['day_issued']
-
-    # Standardize continuous variables
-    scaler = StandardScaler()
-    features_to_scale = ['day_issued', 'validity_period']
-    df_scaled = df.copy()
-    df_scaled[features_to_scale] = scaler.fit_transform(df[features_to_scale])
-
-    # Prepare feature matrix
-    X = df_scaled[['is_typeC', 'day_issued', 'validity_period']]
-
-    # Prepare survival data structure
-    y = np.zeros(len(df), dtype=[('event', bool), ('time', float)])
-    y['event'] = df['event'].astype(bool)
-    y['time'] = df['duration']
-
-    return X, y, scaler
-
-
 def plot_feature_importance(importance_df):
     """
     Plot feature importance using matplotlib with Agg backend
@@ -503,9 +578,10 @@ def plot_feature_importance(importance_df):
     plt.close()
 
 
-def plot_survival_curves(rsf, y_train, scenarios):
+def plot_survival_curves(rsf, y_train, X):
     """
     Plot survival curves using matplotlib with Agg backend
+    Modified to handle all features
     """
     plt.figure(figsize=(10, 6))
     plt.clf()
@@ -513,7 +589,26 @@ def plot_survival_curves(rsf, y_train, scenarios):
     # Get time points
     times = np.percentile(y_train['time'], np.linspace(0, 100, 100))
 
-    for i, row in scenarios.iterrows():
+    # Create two scenarios: TypeB and TypeC
+    # Start with average values for all features
+    scenario_base = pd.DataFrame(np.zeros((2, X.shape[1])), columns=X.columns)
+
+    # Set basic feature values (using means for continuous variables)
+    scenario_base['day_issued'] = X['day_issued'].mean()
+    scenario_base['validity_period'] = X['validity_period'].mean()
+
+    # Set TypeB and TypeC
+    scenario_base.iloc[0, scenario_base.columns.get_loc('is_typeC')] = 0  # TypeB
+    scenario_base.iloc[1, scenario_base.columns.get_loc('is_typeC')] = 1  # TypeC
+
+    # Set most common values for categorical variables
+    for col in X.columns:
+        if col not in ['is_typeC', 'day_issued', 'validity_period']:
+            most_common = X[col].mode()[0]
+            scenario_base[col] = most_common
+
+    # Plot survival curves
+    for i, row in scenario_base.iterrows():
         surv_fn = rsf.predict_survival_function(row.values.reshape(1, -1))[0]
         surv_probs = [surv_fn(t) for t in times]
         plt.plot(
@@ -523,7 +618,7 @@ def plot_survival_curves(rsf, y_train, scenarios):
             linewidth=2
         )
 
-    plt.title('Predicted Survival Curves by Campaign Type')
+    plt.title('Predicted Survival Curves by Campaign Type\n(with average demographic features)')
     plt.xlabel('Time (days)')
     plt.ylabel('Survival probability')
     plt.grid(True)
@@ -585,15 +680,9 @@ def run_rsf_analysis(df):
     # 绘制特征重要性图
     plot_feature_importance(importance_df)
 
-    # 创建场景预测
-    scenarios = pd.DataFrame({
-        'is_typeC': [0, 1],
-        'day_issued': [0, 0],
-        'validity_period': [0, 0]
-    })
-
     print("\nGenerating survival curves for different scenarios...")
-    plot_survival_curves(rsf, y_train, scenarios)
+    # 使用完整的特征集来生成生存曲线
+    plot_survival_curves(rsf, y_train, X)
 
     print("\nFeature Summary Statistics:")
     print(X.describe())
@@ -601,20 +690,481 @@ def run_rsf_analysis(df):
     return rsf, importance_df, (X_train, X_test, y_train, y_test)
 
 
+def save_model_results(cph, rsf, importance_df, file_path='model_results.pdf'):
+    """
+    将模型结果保存为PDF
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from io import StringIO
+    import sys
+
+    # 创建PDF文档
+    doc = SimpleDocTemplate(file_path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # 添加标题和日期
+    elements.append(Paragraph("Survival Analysis Results", styles['Heading1']))
+    elements.append(Spacer(1, 12))
+
+    # Cox模型结果
+    elements.append(Paragraph("Cox Proportional Hazards Model Results", styles['Heading2']))
+    elements.append(Spacer(1, 12))
+
+    # 创建Cox模型结果表格
+    cox_stats = [
+        ['Number of observations', str(cph._n_examples)],
+        ['Number of events', str(cph.event_observed.sum())],
+        ['Concordance', f"{cph.concordance_index_:.3f}"],
+        ['Partial AIC', f"{cph.AIC_partial_:.2f}"],
+        ['Log-likelihood ratio test', f"{cph.log_likelihood_ratio_test().test_statistic:.2f}"],
+        ['Number of parameters', str(len(cph.params_))]
+    ]
+
+    # Cox模型系数表格
+    coef_df = pd.DataFrame({
+        'coef': cph.params_,
+        'exp(coef)': np.exp(cph.params_),
+        'se(coef)': cph.standard_errors_,
+        'z': cph.summary['z'],
+        'p': cph.summary['p'],
+    }).round(3)
+
+    coef_data = [['Variable', 'Coef', 'Exp(coef)', 'SE', 'z', 'p-value']] + \
+                [[idx] + list(row) for idx, row in coef_df.iterrows()]
+
+    # RSF结果
+    elements.append(Paragraph("Random Survival Forest Results", styles['Heading2']))
+    elements.append(Spacer(1, 12))
+
+    # 特征重要性表格
+    importance_data = [['Feature', 'Importance', 'Std']] + \
+                      importance_df.values.tolist()
+
+    # 添加表格样式
+    def create_table_with_style(data, header=True):
+        if header:
+            style = [
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ]
+        else:
+            style = [
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ]
+        return Table(data, style=TableStyle(style))
+
+    # 添加所有表格到PDF
+    elements.append(create_table_with_style(cox_stats, header=False))
+    elements.append(Spacer(1, 12))
+    elements.append(create_table_with_style(coef_data))
+    elements.append(Spacer(1, 12))
+    elements.append(create_table_with_style(importance_data))
+
+    # 生成PDF
+    doc.build(elements)
+
+    print(f"Results saved to {file_path}")
+
+
+def save_detailed_results(df, cox_data, importance_df, file_path='detailed_results.xlsx'):
+    """
+    保存详细结果到Excel文件，包括数据统计、模型结果和图表
+    """
+    with pd.ExcelWriter(file_path, engine='xlsxwriter') as writer:
+        # 基础数据统计
+        df.describe().round(3).to_excel(writer, sheet_name='Data_Summary')
+
+        # Cox模型数据
+        cox_data.describe().round(3).to_excel(writer, sheet_name='Cox_Data')
+
+        # 特征重要性
+        importance_df.round(3).to_excel(writer, sheet_name='Feature_Importance')
+
+        # 保存图表
+        workbook = writer.book
+
+        # 添加图表工作表
+        worksheet = workbook.add_worksheet('Charts')
+
+        # 保存特征重要性数据
+        importance_data = importance_df.values.tolist()
+        for i, row in enumerate(importance_data):
+            worksheet.write_row(i, 0, row)
+
+    print(f"Detailed results saved to {file_path}")
+
+
+## Considering Ordinality in HH Demographics Data
+
+def extract_age_group(s):
+    """
+    将 'Age GroupX' 形式的字符串转换成数值 X
+    若 s 为空或不是字符串，返回 np.nan
+    """
+    if not isinstance(s, str):
+        return np.nan
+    # 假设是固定格式，比如 'Age Group4'
+    return int(s.replace("Age Group", "").strip())
+
+
+def transform_ordinal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将具有顺序意义的分类字段转换成可数值化的顺序编码，
+    针对 classification_1 ~ classification_5, KID_CATEGORY_DESC, HOMEOWNER_DESC。
+    """
+    df = df.copy()  # 不修改原 df
+
+    # 1) classification_1: "Age Group4" -> 4, ...
+    if 'classification_1' in df.columns:
+        df['classification_1_ordinal'] = df['classification_1'].apply(extract_age_group)
+
+    # 2) classification_2: "X", "Y", "Z" -> 1, 2, 3（示例）
+    mapping_2 = {'X': 1, 'Y': 2, 'Z': 3}
+    if 'classification_2' in df.columns:
+        def map_class2(s):
+            return mapping_2.get(s, np.nan)
+        df['classification_2_ordinal'] = df['classification_2'].apply(map_class2)
+
+    # 3) classification_3: "Level1" ~ "Level12" -> 取中间数字
+    def extract_level(s):
+        if not isinstance(s, str):
+            return np.nan
+        return int(s.replace("Level", "").strip())
+
+    if 'classification_3' in df.columns:
+        df['classification_3_ordinal'] = df['classification_3'].apply(extract_level)
+
+    # 4) classification_4 的唯一值: ['2' '3' '4' '1' '5+']
+    #    假设 "5+" 表示比 5 更高一些，所以映射为 6
+    if 'classification_4' in df.columns:
+        def parse_class_4(val):
+            if pd.isna(val):
+                return np.nan
+            val_str = str(val).strip()
+            if val_str.endswith('+'):
+                base = val_str.replace('+', '')
+                # "5+" -> "5" -> int(5) + 1 -> 6
+                try:
+                    return int(base) + 1
+                except:
+                    return np.nan
+            else:
+                # 常规整数字符
+                try:
+                    return int(val_str)
+                except:
+                    return np.nan
+        df['classification_4_ordinal'] = df['classification_4'].apply(parse_class_4)
+
+    # 5) classification_5 的唯一值: ['Group5' 'Group4' 'Group3' 'Group2' 'Group1' 'Group6']
+    #    说明可以做一个字典映射
+    if 'classification_5' in df.columns:
+        classification_5_map = {
+            'Group1': 1,
+            'Group2': 2,
+            'Group3': 3,
+            'Group4': 4,
+            'Group5': 5,
+            'Group6': 6
+        }
+        def parse_class_5(val):
+            if pd.isna(val):
+                return np.nan
+            return classification_5_map.get(val, np.nan)
+        df['classification_5_ordinal'] = df['classification_5'].apply(parse_class_5)
+
+    # 6) KID_CATEGORY_DESC 的唯一值: ['None/Unknown' '1' '2' '3+']
+    #    假设 "3+" 表示比 3 多一些，就映射成 4；"None/Unknown" -> 0
+    if 'KID_CATEGORY_DESC' in df.columns:
+        kid_map = {
+            'None/Unknown': 0,
+            '1': 1,
+            '2': 2,
+            '3+': 3  # 或者写成 4，看你需求
+        }
+        df['KID_CATEGORY_DESC_ordinal'] = df['KID_CATEGORY_DESC'].map(kid_map)
+
+    # 7) HOMEOWNER_DESC 可能没明显顺序：例如 "Homeowner"/"Unknown" 等
+    #    简化成 Homeowner=1, 否则=0
+    if 'HOMEOWNER_DESC' in df.columns:
+        df['HOMEOWNER_ordinal'] = df['HOMEOWNER_DESC'].apply(
+            lambda x: 1 if x == 'Homeowner' else 0
+        )
+
+    return df
+
+
+def prepare_cox_data_2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    与原函数类似，但将分类变量视为有序变量，而非哑变量。
+    先行调用 transform_ordinal_features() 来生成 `_ordinal` 字段。
+    """
+    # ---------------------------
+    # 1. 先对 df 做有序转换
+    # ---------------------------
+    df = transform_ordinal_features(df)
+
+    # Campaign type indicator
+    typeC_campaigns = [3, 6, 14, 15, 20, 27]
+    df['is_typeC'] = df['CAMPAIGN'].isin(typeC_campaigns).astype(int)
+
+    # Calculate validity period
+    df['validity_period'] = df['day_expired'] - df['day_issued']
+
+    # 同样做连续变量的标准化
+    df['day_issued_std'] = (df['day_issued'] - df['day_issued'].mean()) / df['day_issued'].std()
+    df['validity_period_std'] = (df['validity_period'] - df['validity_period'].mean()) / df['validity_period'].std()
+
+    # ---------------------------
+    # 2. 组装 Cox 模型所需的最终变量
+    # ---------------------------
+    # 这里我们就用 *_ordinal 的列，而不是做 dummies
+    # 当然如果 HOMEOWNER_DESC 要保持离散，可以额外加进去
+    cox_columns = [
+        'duration', 'event', 'is_typeC',
+        'day_issued_std', 'validity_period_std',
+        # ordinal columns:
+        'classification_1_ordinal',
+        'classification_2_ordinal',
+        'classification_3_ordinal',
+        'classification_4_ordinal',
+        'classification_5_ordinal',
+        'KID_CATEGORY_DESC_ordinal',
+        'HOMEOWNER_ordinal'
+    ]
+
+    # 只保留 df 已经存在的列（有些项目里字段不一定都有）
+    cox_columns_final = [col for col in cox_columns if col in df.columns]
+
+    cox_data_2 = df[cox_columns_final].copy()
+
+    return cox_data_2
+
+
+def prepare_rsf_data_2(df: pd.DataFrame):
+    """
+    将分类变量按顺序进行编码后，再进入随机生存森林模型。
+    """
+    # 1) 先转换有序字段
+    df = transform_ordinal_features(df)
+
+    # 2) Create campaign type indicator
+    typeC_campaigns = [3, 6, 14, 15, 20, 27]
+    df['is_typeC'] = df['CAMPAIGN'].isin(typeC_campaigns).astype(int)
+
+    # 3) Calculate validity period
+    df['validity_period'] = df['day_expired'] - df['day_issued']
+
+    # 4) 对需要标准化的字段做标准化（这里以 day_issued, validity_period 为例）
+    scaler = StandardScaler()
+    features_to_scale = ['day_issued', 'validity_period']
+    df_scaled = df.copy()
+    df_scaled[features_to_scale] = scaler.fit_transform(df[features_to_scale])
+
+    # 5) 将 ordinal 字段当做数值特征加入 X
+    #    同时保留 is_typeC, day_issued, validity_period(已标准化)
+    feature_cols = [
+        'is_typeC', 'day_issued', 'validity_period',
+        'classification_1_ordinal',
+        'classification_2_ordinal',
+        'classification_3_ordinal',
+        'classification_4_ordinal',
+        'classification_5_ordinal',
+        'KID_CATEGORY_DESC_ordinal',
+        'HOMEOWNER_ordinal'
+    ]
+
+    # 只保留 df 中有的列
+    feature_cols_final = [col for col in feature_cols if col in df_scaled.columns]
+    X_2 = df_scaled[feature_cols_final].copy()
+
+    # 6) Survival data structure
+    y_2 = np.zeros(len(df), dtype=[('event', bool), ('time', float)])
+    y_2['event'] = df['event'].astype(bool)
+    y_2['time'] = df['duration']
+
+    return X_2, y_2, scaler
+
+def plot_feature_importance_v2(importance_df):
+    """
+    Plot feature importance for RSF (v2) using matplotlib with Agg backend
+    """
+    plt.figure(figsize=(10, 6))
+    plt.clf()
+
+    bars = plt.bar(
+        range(len(importance_df)),
+        importance_df['importance_mean'],
+        yerr=importance_df['importance_std'],
+        capsize=5,
+        color='skyblue'
+    )
+
+    plt.xticks(
+        range(len(importance_df)),
+        importance_df['feature'],
+        rotation=45,
+        ha='right'
+    )
+    plt.title('Feature Importance in Random Survival Forest (v2)')
+    plt.xlabel('Features')
+    plt.ylabel('Importance Score')
+    plt.grid(True, alpha=0.3)
+
+    # Add value labels
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(
+            bar.get_x() + bar.get_width() / 2.,
+            height,
+            f'{height:.3f}',
+            ha='center',
+            va='bottom'
+        )
+
+    plt.tight_layout()
+    plt.savefig('rsf_feature_importance_v2.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Feature importance figure saved as rsf_feature_importance_v2.png")
+
+
+def plot_survival_curves_v2(rsf, y_train, X):
+    """
+    Plot survival curves for RSF (v2) using matplotlib with Agg backend
+    """
+    plt.figure(figsize=(10, 6))
+    plt.clf()
+
+    # Get time points
+    times = np.percentile(y_train['time'], np.linspace(0, 100, 100))
+
+    # Create two scenarios: TypeB and TypeC
+    # Start with average values for all features
+    scenario_base = pd.DataFrame(np.zeros((2, X.shape[1])), columns=X.columns)
+
+    # Set basic feature values (using means for continuous variables)
+    scenario_base['day_issued'] = X['day_issued'].mean()
+    scenario_base['validity_period'] = X['validity_period'].mean()
+
+    # Set TypeB and TypeC
+    scenario_base.iloc[0, scenario_base.columns.get_loc('is_typeC')] = 0  # TypeB
+    scenario_base.iloc[1, scenario_base.columns.get_loc('is_typeC')] = 1  # TypeC
+
+    # Set most common values for categorical variables
+    for col in X.columns:
+        if col not in ['is_typeC', 'day_issued', 'validity_period']:
+            most_common = X[col].mode()[0]
+            scenario_base[col] = most_common
+
+    # Plot survival curves
+    for i, row in scenario_base.iterrows():
+        surv_fn = rsf.predict_survival_function(row.values.reshape(1, -1))[0]
+        surv_probs = [surv_fn(t) for t in times]
+        plt.plot(
+            times,
+            surv_probs,
+            label=f"{'Type C' if row['is_typeC'] else 'Type B'} Campaign",
+            linewidth=2
+        )
+
+    plt.title('Predicted Survival Curves by Campaign Type (v2)\n(with average demographic features)')
+    plt.xlabel('Time (days)')
+    plt.ylabel('Survival probability')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('rsf_survival_curves_v2.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Survival curves figure saved as rsf_survival_curves_v2.png")
+
+
 # MAIN
 
 ## clean data
 df = create_complete_dataset()
 
-## KM
-df_km = basic_survival_analysis(df)
+## KM kaplan-mierer
+# df_km = basic_survival_analysis(df)
 
 ## Log Rank
 df = prepare_basic_survival_data(df)
-df_lr, stats_by_type = analyze_campaign_types(df)
+
+
+# df_lr, stats_by_type = analyze_campaign_types(df)
 
 ## Cox
 cph, cox_data = run_cox_analysis(df)
 
 ## RSF
 rsf_model, importance_df, split_data = run_rsf_analysis(df)
+
+## Save model result
+# save_model_results(cph, rsf_model, importance_df)
+# 运行保存功能
+save_model_results(cph, rsf_model, importance_df, 'survival_analysis_results.pdf')
+save_detailed_results(df, cox_data, importance_df, 'survival_analysis_detailed.xlsx')
+
+# v2：ordinal
+
+df_2 = transform_ordinal_features(df)
+
+# Cox：
+cox_data_2 = prepare_cox_data_2(df)
+cph_2 = CoxPHFitter()
+cox_data_2_no_na = cox_data_2.dropna(axis=0)
+
+cph_2.fit(
+    cox_data_2_no_na,
+    duration_col='duration',
+    event_col='event',
+    show_progress=True
+)
+
+print(cph_2.summary)
+plot_hazard_ratios(
+    cph_2,
+    filename="hazard_ratios_v2.png",
+    title="Significant Hazard Ratios from Cox Model (v2)"
+)
+
+# RSF：
+X_2, y_2, scaler_2 = prepare_rsf_data_2(df)
+#   注意：X_2 是 DataFrame，可以直接 isna().any(axis=1)
+na_mask = X_2.isna().any(axis=1)
+print("Number of rows with NaN:", na_mask.sum())
+#   取反：只保留没NaN的行
+X_2_no_na = X_2[~na_mask].copy()
+y_2_no_na = y_2[~na_mask]
+# 然后再 train_test_split
+X2_train, X2_test, y2_train, y2_test = train_test_split(
+    X_2_no_na,
+    y_2_no_na,
+    test_size=0.2,
+    random_state=42
+)
+
+# 训练 RSF
+rsf_2 = RandomSurvivalForest(
+    n_estimators=100,
+    min_samples_leaf=15,
+    max_features='sqrt',
+    n_jobs=-1,
+    random_state=42
+)
+rsf_2.fit(X2_train, y2_train)
+# importance_df_v2 是计算后的特征重要性 DataFrame
+
+# 5) 评估
+print("New RSF C-index (train):", rsf_2.score(X2_train, y2_train))
+print("New RSF C-index (test):", rsf_2.score(X2_test, y2_test))
+
