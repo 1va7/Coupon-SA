@@ -602,19 +602,18 @@ def run_rsf_analysis(df):
 
 
 # MAIN
+if __name__ == '__main__':
+    # 创建完整数据集
+    df = create_complete_dataset()
 
-## clean data
-df = create_complete_dataset()
+    # 基本生存分析
+    df = basic_survival_analysis(df)
 
-## KM
-df_km = basic_survival_analysis(df)
+    # 比较TypeB和TypeC活动的生存分析
+    df_lr, stats_by_type = analyze_campaign_types(df)
 
-## Log Rank
-df = prepare_basic_survival_data(df)
-df_lr, stats_by_type = analyze_campaign_types(df)
+    # Cox比例风险模型
+    cph, cox_data = run_cox_analysis(df)
 
-## Cox
-cph, cox_data = run_cox_analysis(df)
-
-## RSF
-rsf_model, importance_df, split_data = run_rsf_analysis(df)
+    # 随机生存森林
+    rsf_model, importance_df, split_data = run_rsf_analysis(df)
